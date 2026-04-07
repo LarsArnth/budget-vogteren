@@ -150,9 +150,9 @@ function App() {
 
   useEffect(() => {
     if (!user) return;
-    fetchStats();
+    if (tab === "overview") fetchStats();
     fetchCategories();
-  }, [user, fetchStats, fetchCategories]);
+  }, [user, tab, fetchStats, fetchCategories]);
 
   useEffect(() => {
     if (!user) return;

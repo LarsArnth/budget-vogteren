@@ -1,161 +1,169 @@
 export async function onRequestPost(context) {
   const { request, env } = context;
-  const formData = await request.formData();
-  const file = formData.get("file");
 
-  if (!file) {
-    return new Response(JSON.stringify({ error: "No file uploaded" }), {
-      status: 400,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
+  try {
+    const formData = await request.formData();
+    const file = formData.get("file");
 
-  const csvText = await file.text();
-  const lines = csvText.split("\n").filter((l) => l.trim());
-  const headers = lines[0]
-    .split(";")
-    .map((h) => h.replace(/"/g, "").trim().toLowerCase());
+    if (!file) {
+      return jsonResponse({ error: "No file uploaded" }, 400);
+    }
 
-  const format = detectFormat(headers);
-  if (!format) {
-    return new Response(
-      JSON.stringify({
-        error:
-          "Ukendt CSV-format. Forventede kolonner: Dato, Beskrivelse/Tekst, Beløb",
-        headers,
-      }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
-    );
-  }
+    let csvText;
+    if (typeof file === "string") {
+      csvText = file;
+    } else if (typeof file?.text === "function") {
+      csvText = await file.text();
+    } else if (typeof file?.arrayBuffer === "function") {
+      const buf = await file.arrayBuffer();
+      csvText = new TextDecoder("utf-8").decode(buf);
+    } else {
+      return jsonResponse({ error: "Kunne ikke laese filen" }, 400);
+    }
 
-  // Parse transactions from CSV
-  const transactions = [];
-  for (let i = 1; i < lines.length; i++) {
-    const row = lines[i].split(";").map((c) => c.replace(/"/g, "").trim());
-    if (row.length < 3) continue;
+    // Strip BOM
+    if (csvText.charCodeAt(0) === 0xfeff) {
+      csvText = csvText.slice(1);
+    }
 
-    const date = row[format.dateIdx];
-    const description = row[format.descIdx] || "";
-    const amountStr = (row[format.amountIdx] || "0")
-      .replace(/\./g, "")
-      .replace(",", ".");
-    const amount = parseFloat(amountStr);
+    const lines = csvText.split("\n").filter((l) => l.trim());
+    if (lines.length < 2) {
+      return jsonResponse({ error: "Filen er tom" }, 400);
+    }
 
-    if (!date || isNaN(amount)) continue;
+    const headers = lines[0]
+      .split(";")
+      .map((h) => h.replace(/"/g, "").trim().toLowerCase());
 
-    const id =
-      format.idIdx !== null
+    const format = detectFormat(headers);
+    if (!format) {
+      return jsonResponse({
+        error: "Ukendt CSV-format",
+        detectedHeaders: headers.slice(0, 5),
+      }, 400);
+    }
+
+    // Load category lookup: "main|sub" -> id
+    const catResult = await env.DB.prepare(
+      "SELECT id, main_category, sub_category FROM categories"
+    ).all();
+    const catLookup = new Map();
+    for (const c of (catResult.results || [])) {
+      catLookup.set(`${c.main_category}|${c.sub_category}`, c.id);
+    }
+
+    // Load mapping lookups (exact match only - fast O(1))
+    const [mappingsResult, mpMappingsResult] = await Promise.all([
+      env.DB.prepare("SELECT pattern, category_id FROM mappings").all(),
+      env.DB.prepare("SELECT name, category_id FROM mobilepay_mappings").all(),
+    ]);
+
+    const mappingLookup = new Map();
+    for (const m of (mappingsResult.results || [])) {
+      mappingLookup.set(m.pattern.toLowerCase(), m.category_id);
+    }
+    const mpLookup = new Map();
+    for (const mp of (mpMappingsResult.results || [])) {
+      mpLookup.set(mp.name.toLowerCase(), mp.category_id);
+    }
+
+    // Parse and categorize transactions
+    let categorized = 0;
+    let uncategorized = 0;
+    const batch = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const row = lines[i].split(";").map((c) => c.replace(/"/g, "").trim());
+      if (row.length < 3) continue;
+
+      const date = row[format.dateIdx];
+      const description = row[format.descIdx] || "";
+      const amountStr = (row[format.amountIdx] || "0")
+        .replace(/\./g, "")
+        .replace(",", ".");
+      const amount = parseFloat(amountStr);
+
+      if (!date || isNaN(amount)) continue;
+
+      const id = format.idIdx !== null
         ? row[format.idIdx]
         : hashId(date, description, amount, i);
 
-    transactions.push({
-      id,
-      date: normalizeDate(date),
-      description,
-      original_description:
-        format.origDescIdx !== null ? row[format.origDescIdx] : description,
-      amount,
-      account_name:
-        format.accountIdx !== null ? (row[format.accountIdx] || "") : "",
-    });
-  }
+      // Determine category
+      let categoryId = null;
 
-  if (transactions.length === 0) {
-    return new Response(
-      JSON.stringify({ error: "Ingen posteringer fundet i filen" }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
-    );
-  }
-
-  // Load all mappings for categorization
-  const [mappingsResult, mpMappingsResult] = await Promise.all([
-    env.DB.prepare("SELECT pattern, category_id FROM mappings").all(),
-    env.DB.prepare("SELECT name, category_id FROM mobilepay_mappings").all(),
-  ]);
-
-  const mappings = mappingsResult.results || [];
-  const mpMappings = mpMappingsResult.results || [];
-
-  const mappingLookup = new Map();
-  for (const m of mappings) {
-    mappingLookup.set(m.pattern.toLowerCase(), m.category_id);
-  }
-  const mpLookup = new Map();
-  for (const mp of mpMappings) {
-    mpLookup.set(mp.name.toLowerCase(), mp.category_id);
-  }
-
-  let categorized = 0;
-  let uncategorized = 0;
-  const batch = [];
-
-  for (const t of transactions) {
-    let categoryId = null;
-    const descLower = t.description.toLowerCase();
-
-    // 1. MobilePay mapping
-    if (descLower.startsWith("mobilepay:")) {
-      const mpName = t.description.substring("mobilepay:".length).trim();
-      categoryId = mpLookup.get(mpName.toLowerCase()) || null;
-    }
-
-    // 2. Exact match on description
-    if (!categoryId) {
-      categoryId = mappingLookup.get(descLower) || null;
-    }
-
-    // 3. Partial match - description contains a known pattern
-    if (!categoryId) {
-      for (const [pattern, catId] of mappingLookup) {
-        if (descLower.includes(pattern) || pattern.includes(descLower)) {
-          categoryId = catId;
-          break;
+      // Strategy 1: If CSV has category columns (Spiir format), use them
+      if (format.mainCatIdx !== null && format.subCatIdx !== null) {
+        const mainCat = row[format.mainCatIdx] || "";
+        const subCat = row[format.subCatIdx] || "";
+        if (mainCat && subCat) {
+          categoryId = catLookup.get(`${mainCat}|${subCat}`) || null;
         }
       }
+
+      // Strategy 2: MobilePay mapping
+      if (!categoryId) {
+        const descLower = description.toLowerCase();
+        if (descLower.startsWith("mobilepay:")) {
+          const mpName = description.substring("mobilepay:".length).trim();
+          categoryId = mpLookup.get(mpName.toLowerCase()) || null;
+        }
+
+        // Strategy 3: Exact match on description
+        if (!categoryId) {
+          categoryId = mappingLookup.get(descLower) || null;
+        }
+      }
+
+      if (categoryId) categorized++;
+      else uncategorized++;
+
+      batch.push(
+        env.DB.prepare(
+          `INSERT OR REPLACE INTO transactions (id, date, description, original_description, amount, category_id, account_name)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          id,
+          normalizeDate(date),
+          description,
+          format.origDescIdx !== null ? (row[format.origDescIdx] || description) : description,
+          amount,
+          categoryId,
+          format.accountIdx !== null ? (row[format.accountIdx] || "") : ""
+        )
+      );
     }
 
-    if (categoryId) categorized++;
-    else uncategorized++;
+    if (batch.length === 0) {
+      return jsonResponse({ error: "Ingen posteringer fundet i filen" }, 400);
+    }
 
-    batch.push(
-      env.DB.prepare(
-        `INSERT OR REPLACE INTO transactions (id, date, description, original_description, amount, category_id, account_name)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        t.id,
-        t.date,
-        t.description,
-        t.original_description,
-        t.amount,
-        categoryId,
-        t.account_name
-      )
-    );
-  }
+    // D1 batch limit is ~100 statements
+    for (let i = 0; i < batch.length; i += 100) {
+      await env.DB.batch(batch.slice(i, i + 100));
+    }
 
-  // D1 batch limit is ~100 statements
-  for (let i = 0; i < batch.length; i += 100) {
-    await env.DB.batch(batch.slice(i, i + 100));
-  }
-
-  return new Response(
-    JSON.stringify({
+    return jsonResponse({
       success: true,
-      total: transactions.length,
+      total: batch.length,
       categorized,
       uncategorized,
-    }),
-    { headers: { "Content-Type": "application/json" } }
-  );
+    });
+  } catch (err) {
+    return jsonResponse({ error: "Server-fejl: " + (err.message || String(err)) }, 500);
+  }
+}
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 function detectFormat(headers) {
-  // Spiir full export (24 cols)
-  if (
-    headers.includes("id") &&
-    headers.includes("amount") &&
-    headers.length > 10
-  ) {
+  // Spiir full export (24 cols): Id;AccountId;AccountName;...;Amount;...
+  if (headers.includes("id") && headers.includes("amount") && headers.length > 10) {
     return {
       idIdx: headers.indexOf("id"),
       dateIdx: headers.indexOf("date"),
@@ -163,47 +171,50 @@ function detectFormat(headers) {
       origDescIdx: headers.indexOf("originaldescription"),
       amountIdx: headers.indexOf("amount"),
       accountIdx: headers.indexOf("accountname"),
+      mainCatIdx: headers.indexOf("maincategoryname"),
+      subCatIdx: headers.indexOf("categoryname"),
     };
   }
-  // Spiir simple export
-  if (
-    headers.includes("konto") &&
-    headers.includes("beskrivelse") &&
-    headers.includes("beløb")
-  ) {
+  // Spiir simple export: Konto;Dato;Beskrivelse;Hovedkategori;Kategori;Type;Beloeb;...
+  if (headers.includes("beskrivelse") && headers.includes("dato")) {
+    const belobIdx = headers.indexOf("beløb") !== -1 ? headers.indexOf("beløb") : headers.indexOf("belob");
     return {
       idIdx: null,
       dateIdx: headers.indexOf("dato"),
       descIdx: headers.indexOf("beskrivelse"),
       origDescIdx: null,
-      amountIdx: headers.indexOf("beløb"),
-      accountIdx: headers.indexOf("konto"),
+      amountIdx: belobIdx,
+      accountIdx: headers.indexOf("konto") !== -1 ? headers.indexOf("konto") : null,
+      mainCatIdx: headers.indexOf("hovedkategori") !== -1 ? headers.indexOf("hovedkategori") : null,
+      subCatIdx: headers.indexOf("kategori") !== -1 ? headers.indexOf("kategori") : null,
     };
   }
-  // Generic Danish bank CSV
-  if (
-    headers.includes("dato") &&
-    headers.includes("tekst") &&
-    headers.includes("beløb")
-  ) {
+  // Generic Danish bank CSV: Dato;Tekst;Beloeb
+  if (headers.includes("tekst") && headers.includes("dato")) {
+    const belobIdx = headers.indexOf("beløb") !== -1 ? headers.indexOf("beløb") : headers.indexOf("belob");
     return {
       idIdx: null,
       dateIdx: headers.indexOf("dato"),
       descIdx: headers.indexOf("tekst"),
       origDescIdx: null,
-      amountIdx: headers.indexOf("beløb"),
+      amountIdx: belobIdx,
       accountIdx: null,
+      mainCatIdx: null,
+      subCatIdx: null,
     };
   }
-  // Sydbank: Bogført;Tekst;Beløb
+  // Sydbank: Bogfoert;Tekst;Beloeb
   if (headers.includes("bogført") && headers.includes("tekst")) {
+    const belobIdx = headers.indexOf("beløb") !== -1 ? headers.indexOf("beløb") : headers.indexOf("belob");
     return {
       idIdx: null,
       dateIdx: headers.indexOf("bogført"),
       descIdx: headers.indexOf("tekst"),
       origDescIdx: null,
-      amountIdx: headers.indexOf("beløb"),
+      amountIdx: belobIdx,
       accountIdx: null,
+      mainCatIdx: null,
+      subCatIdx: null,
     };
   }
   return null;
