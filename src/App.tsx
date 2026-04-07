@@ -112,6 +112,7 @@ function App() {
   const fetchStats = useCallback(async () => {
     try {
       const res = await fetch(`/api/stats?month=${month}`);
+      if (!res.ok) return;
       const data = await res.json();
       setStats(data);
     } catch {
@@ -126,6 +127,7 @@ function App() {
         if (opts?.uncategorized) params.set("uncategorized", "true");
         if (opts?.mobilepay) params.set("mobilepay", "true");
         const res = await fetch(`/api/transactions?${params}`);
+        if (!res.ok) return;
         const data = await res.json();
         setTransactions(data);
       } catch {
@@ -138,6 +140,7 @@ function App() {
   const fetchCategories = useCallback(async () => {
     try {
       const res = await fetch("/api/categories");
+      if (!res.ok) return;
       const data = await res.json();
       setCategories(data);
     } catch {
@@ -146,15 +149,17 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!user) return;
     fetchStats();
     fetchCategories();
-  }, [fetchStats, fetchCategories]);
+  }, [user, fetchStats, fetchCategories]);
 
   useEffect(() => {
+    if (!user) return;
     if (tab === "transactions") fetchTransactions();
     else if (tab === "uncategorized") fetchTransactions({ uncategorized: true });
     else if (tab === "mobilepay") fetchTransactions({ mobilepay: true });
-  }, [tab, month, fetchTransactions]);
+  }, [user, tab, month, fetchTransactions]);
 
   const handleImport = async () => {
     if (!file) return;
