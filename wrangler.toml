@@ -1,0 +1,8 @@
+
+name = "budget-vogteren"
+pages_build_output_dir = "./dist"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "budget-db"
+database_id = "217f67c2-1b55-44ea-8dcc-b1435bd707a0"
