@@ -67,10 +67,21 @@ export async function onRequestPost(context) {
       mpLookup.set(mp.name.toLowerCase(), mp.category_id);
     }
 
+    // Load split rules: pattern -> [{category_id, percentage, label}]
+    const { results: splitRulesRaw } = await env.DB.prepare(
+      "SELECT pattern, category_id, percentage, label FROM split_rules"
+    ).all();
+    const splitRules = new Map();
+    for (const sr of (splitRulesRaw || [])) {
+      if (!splitRules.has(sr.pattern)) splitRules.set(sr.pattern, []);
+      splitRules.get(sr.pattern).push(sr);
+    }
+
     // Parse and categorize transactions
     let categorized = 0;
     let uncategorized = 0;
     const batch = [];
+    const splitBatch = [];
 
     for (let i = 1; i < lines.length; i++) {
       const row = lines[i].split(";").map((c) => c.replace(/"/g, "").trim());
@@ -115,16 +126,36 @@ export async function onRequestPost(context) {
         }
       }
 
-      if (categoryId) categorized++;
-      else uncategorized++;
+      // Check for split rules
+      const rules = splitRules.get(description);
+      if (rules && rules.length > 0) {
+        // Use the largest-percentage category as main
+        const mainRule = rules.reduce((a, b) => a.percentage > b.percentage ? a : b);
+        categoryId = mainRule.category_id;
+        categorized++;
 
+        // Queue split inserts
+        for (const rule of rules) {
+          splitBatch.push(
+            env.DB.prepare(
+              "INSERT OR REPLACE INTO transaction_splits (transaction_id, category_id, amount, description) VALUES (?, ?, ?, ?)"
+            ).bind(id, rule.category_id, amount * (rule.percentage / 100), rule.label || null)
+          );
+        }
+      } else if (categoryId) {
+        categorized++;
+      } else {
+        uncategorized++;
+      }
+
+      const normalizedDate = normalizeDate(date);
       batch.push(
         env.DB.prepare(
           `INSERT OR REPLACE INTO transactions (id, date, description, original_description, amount, category_id, account_name)
            VALUES (?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           id,
-          normalizeDate(date),
+          normalizedDate,
           description,
           format.origDescIdx !== null ? (row[format.origDescIdx] || description) : description,
           amount,
@@ -143,11 +174,17 @@ export async function onRequestPost(context) {
       await env.DB.batch(batch.slice(i, i + 100));
     }
 
+    // Insert splits
+    for (let i = 0; i < splitBatch.length; i += 100) {
+      await env.DB.batch(splitBatch.slice(i, i + 100));
+    }
+
     return jsonResponse({
       success: true,
       total: batch.length,
       categorized,
       uncategorized,
+      splits_applied: splitBatch.length,
     });
   } catch (err) {
     return jsonResponse({ error: "Server-fejl: " + (err.message || String(err)) }, 500);

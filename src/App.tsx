@@ -8,6 +8,14 @@ interface User {
   picture: string;
 }
 
+interface Split {
+  category_id: number;
+  amount: number;
+  label: string | null;
+  main_category: string;
+  sub_category: string;
+}
+
 interface Transaction {
   id: string;
   date: string;
@@ -18,6 +26,7 @@ interface Transaction {
   account_name: string;
   main_category: string | null;
   sub_category: string | null;
+  splits: Split[];
 }
 
 interface Category {
@@ -94,6 +103,9 @@ function App() {
   const [categorizeTarget, setCategorizeTarget] = useState<Transaction | null>(null);
   const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
   const [saveMapping, setSaveMapping] = useState(true);
+  const [applyToAll, setApplyToAll] = useState(false);
+  const [modalMode, setModalMode] = useState<"categorize" | "split">("categorize");
+  const [splitRows, setSplitRows] = useState<{ category_id: number | null; amount: string; label: string }[]>([]);
 
   // Check auth on load
   useEffect(() => {
@@ -185,19 +197,78 @@ function App() {
     }
   };
 
+  const openModal = (t: Transaction) => {
+    setCategorizeTarget(t);
+    setSelectedCategoryId(t.category_id);
+    setSaveMapping(true);
+    setApplyToAll(false);
+    if (t.splits && t.splits.length > 0) {
+      setModalMode("split");
+      setSplitRows(t.splits.map((s) => ({
+        category_id: s.category_id,
+        amount: Math.abs(s.amount).toFixed(2),
+        label: s.label || "",
+      })));
+    } else {
+      setModalMode("categorize");
+      setSplitRows([]);
+    }
+  };
+
+  const addSplitRow = () => {
+    setSplitRows((r) => [...r, { category_id: null, amount: "", label: "" }]);
+  };
+
+  const removeSplitRow = (idx: number) => {
+    setSplitRows((r) => r.filter((_, i) => i !== idx));
+  };
+
+  const initSplitFromTransaction = () => {
+    if (!categorizeTarget) return;
+    const total = Math.abs(categorizeTarget.amount);
+    setModalMode("split");
+    setSplitRows([
+      { category_id: categorizeTarget.category_id, amount: (total / 2).toFixed(2), label: "" },
+      { category_id: null, amount: (total / 2).toFixed(2), label: "" },
+    ]);
+  };
+
   const handleCategorize = async () => {
-    if (!categorizeTarget || !selectedCategoryId) return;
-    await fetch("/api/categorize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        transaction_id: categorizeTarget.id,
-        category_id: selectedCategoryId,
-        save_mapping: saveMapping,
-      }),
-    });
+    if (!categorizeTarget) return;
+
+    if (modalMode === "split") {
+      const validSplits = splitRows.filter((r) => r.category_id && r.amount);
+      if (validSplits.length < 2) return;
+      await fetch("/api/categorize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transaction_id: categorizeTarget.id,
+          apply_to_all: applyToAll,
+          splits: validSplits.map((r) => ({
+            category_id: r.category_id,
+            amount: categorizeTarget.amount < 0 ? -Math.abs(parseFloat(r.amount)) : Math.abs(parseFloat(r.amount)),
+            label: r.label || null,
+          })),
+        }),
+      });
+    } else {
+      if (!selectedCategoryId) return;
+      await fetch("/api/categorize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transaction_id: categorizeTarget.id,
+          category_id: selectedCategoryId,
+          save_mapping: saveMapping,
+          apply_to_all: applyToAll,
+        }),
+      });
+    }
+
     setCategorizeTarget(null);
     setSelectedCategoryId(null);
+    setSplitRows([]);
     fetchStats();
     if (tab === "uncategorized") fetchTransactions({ uncategorized: true });
     else if (tab === "mobilepay") fetchTransactions({ mobilepay: true });
@@ -392,7 +463,11 @@ function App() {
                       <td style={{ whiteSpace: "nowrap" }}>{t.date}</td>
                       <td>{t.description}</td>
                       <td>
-                        {t.main_category ? (
+                        {t.splits && t.splits.length > 0 ? (
+                          <span className="split-badge" title={t.splits.map((s) => `${s.main_category}: ${formatDKK(s.amount)}`).join("\n")}>
+                            Split ({t.splits.length})
+                          </span>
+                        ) : t.main_category ? (
                           <span className="category-badge">
                             {t.main_category}
                             {t.sub_category ? ` > ${t.sub_category}` : ""}
@@ -407,19 +482,13 @@ function App() {
                         {formatDKK(t.amount)}
                       </td>
                       <td>
-                        {!t.category_id && (
-                          <button
-                            className="btn btn-secondary"
-                            style={{ padding: "4px 10px", fontSize: "12px" }}
-                            onClick={() => {
-                              setCategorizeTarget(t);
-                              setSelectedCategoryId(null);
-                              setSaveMapping(true);
-                            }}
-                          >
-                            Kategoriser
-                          </button>
-                        )}
+                        <button
+                          className="btn btn-secondary"
+                          style={{ padding: "4px 10px", fontSize: "12px" }}
+                          onClick={() => openModal(t)}
+                        >
+                          Rediger
+                        </button>
                       </td>
                     </tr>
                   ))}
@@ -463,39 +532,131 @@ function App() {
         </div>
       )}
 
-      {/* CATEGORIZE MODAL */}
+      {/* EDIT MODAL */}
       {categorizeTarget && (
         <div className="modal-overlay" onClick={() => setCategorizeTarget(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>Kategoriser postering</h3>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <h3>Rediger postering</h3>
             <p style={{ marginBottom: 12, color: "var(--text)", fontSize: 14 }}>
               <strong>{categorizeTarget.description}</strong>
               <br />
               {formatDKK(categorizeTarget.amount)} &mdash; {categorizeTarget.date}
             </p>
-            <select
-              value={selectedCategoryId ?? ""}
-              onChange={(e) => setSelectedCategoryId(Number(e.target.value) || null)}
-            >
-              <option value="">Vaelg kategori...</option>
-              {Object.entries(groupedCategories).map(([main, cats]) => (
-                <optgroup key={main} label={main}>
-                  {cats.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.sub_category}
-                    </option>
+
+            {/* Mode tabs */}
+            <div className="modal-tabs">
+              <button
+                className={`modal-tab ${modalMode === "categorize" ? "active" : ""}`}
+                onClick={() => setModalMode("categorize")}
+              >
+                Kategoriser
+              </button>
+              <button
+                className={`modal-tab ${modalMode === "split" ? "active" : ""}`}
+                onClick={modalMode === "split" ? undefined : initSplitFromTransaction}
+              >
+                Split
+              </button>
+            </div>
+
+            {modalMode === "categorize" ? (
+              <>
+                <select
+                  value={selectedCategoryId ?? ""}
+                  onChange={(e) => setSelectedCategoryId(Number(e.target.value) || null)}
+                >
+                  <option value="">Vaelg kategori...</option>
+                  {Object.entries(groupedCategories).map(([main, cats]) => (
+                    <optgroup key={main} label={main}>
+                      {cats.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.sub_category}
+                        </option>
+                      ))}
+                    </optgroup>
                   ))}
-                </optgroup>
-              ))}
-            </select>
-            <label>
-              <input
-                type="checkbox"
-                checked={saveMapping}
-                onChange={(e) => setSaveMapping(e.target.checked)}
-              />
-              Husk denne regel til fremtidige posteringer
-            </label>
+                </select>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={saveMapping}
+                    onChange={(e) => setSaveMapping(e.target.checked)}
+                  />
+                  Husk regel til fremtidige posteringer
+                </label>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={applyToAll}
+                    onChange={(e) => setApplyToAll(e.target.checked)}
+                  />
+                  Anvend paa alle med navnet &quot;{categorizeTarget.description}&quot;
+                </label>
+              </>
+            ) : (
+              <>
+                <div className="split-rows">
+                  {splitRows.map((row, idx) => (
+                    <div className="split-row" key={idx}>
+                      <select
+                        value={row.category_id ?? ""}
+                        onChange={(e) => {
+                          const val = Number(e.target.value) || null;
+                          setSplitRows((r) => r.map((rr, i) => i === idx ? { ...rr, category_id: val } : rr));
+                        }}
+                      >
+                        <option value="">Kategori...</option>
+                        {Object.entries(groupedCategories).map(([main, cats]) => (
+                          <optgroup key={main} label={main}>
+                            {cats.map((c) => (
+                              <option key={c.id} value={c.id}>{c.sub_category}</option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                      <input
+                        type="number"
+                        step="0.01"
+                        placeholder="Belob"
+                        value={row.amount}
+                        onChange={(e) => {
+                          setSplitRows((r) => r.map((rr, i) => i === idx ? { ...rr, amount: e.target.value } : rr));
+                        }}
+                        style={{ width: 100 }}
+                      />
+                      <input
+                        type="text"
+                        placeholder="Label (valgfri)"
+                        value={row.label}
+                        onChange={(e) => {
+                          setSplitRows((r) => r.map((rr, i) => i === idx ? { ...rr, label: e.target.value } : rr));
+                        }}
+                        style={{ width: 130 }}
+                      />
+                      <button className="btn btn-secondary" style={{ padding: "4px 8px" }} onClick={() => removeSplitRow(idx)}>
+                        X
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+                  <button className="btn btn-secondary" onClick={addSplitRow}>+ Tilfoej linje</button>
+                  <span style={{ fontSize: 13, color: "var(--text)" }}>
+                    Sum: {formatDKK(splitRows.reduce((s, r) => s + (parseFloat(r.amount) || 0), 0) * (categorizeTarget.amount < 0 ? -1 : 1))}
+                    {" / "}Total: {formatDKK(categorizeTarget.amount)}
+                  </span>
+                </div>
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={applyToAll}
+                    onChange={(e) => setApplyToAll(e.target.checked)}
+                  />
+                  Gem som automatisk split-regel for &quot;{categorizeTarget.description}&quot;
+                </label>
+              </>
+            )}
+
             <div className="modal-actions">
               <button className="btn btn-secondary" onClick={() => setCategorizeTarget(null)}>
                 Annuller
@@ -503,7 +664,7 @@ function App() {
               <button
                 className="btn btn-primary"
                 onClick={handleCategorize}
-                disabled={!selectedCategoryId}
+                disabled={modalMode === "categorize" ? !selectedCategoryId : splitRows.filter((r) => r.category_id && r.amount).length < 2}
               >
                 Gem
               </button>
